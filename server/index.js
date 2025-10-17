@@ -5,759 +5,877 @@ import fetch from "node-fetch";
 import dotenv from "dotenv";
 import { Octokit } from "@octokit/rest";
 import path from "path";
-import crypto from "crypto";
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// Enhanced cache with metadata
-const analysisCache = new Map();
-const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+// Initialize Supabase client
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
 
-// Language detection with enhanced mapping
+// Cache configuration
+const analysisCache = new Map();
+const CACHE_DURATION = 10 * 60 * 1000;
+const MAX_CACHE_ENTRIES = 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  let cleanedCount = 0;
+  
+  for (const [key, value] of analysisCache.entries()) {
+    if (now - value.timestamp > CACHE_DURATION) {
+      analysisCache.delete(key);
+      cleanedCount++;
+    }
+  }
+  
+  if (cleanedCount > 0) {
+    console.log(`🧹 Auto-cleaned ${cleanedCount} expired cache entries`);
+  }
+  
+  if (analysisCache.size > MAX_CACHE_ENTRIES) {
+    const entries = Array.from(analysisCache.entries())
+      .sort((a, b) => a[1].timestamp - b[1].timestamp);
+    
+    const toRemove = entries.slice(0, analysisCache.size - MAX_CACHE_ENTRIES);
+    toRemove.forEach(([key]) => analysisCache.delete(key));
+    
+    console.log(`🧹 Removed ${toRemove.length} oldest cache entries`);
+  }
+}, CACHE_DURATION);
+
+// Language detection
 function detectLanguage(filename) {
   const ext = path.extname(filename).toLowerCase();
   const langMap = {
-    '.js': 'JavaScript',
-    '.jsx': 'JavaScript/React',
-    '.java': 'Java',
-    '.cpp': 'C++',
-    '.c': 'C',
-    '.cs': 'C#',
-    '.php': 'PHP',
-    '.rb': 'Ruby',
-    '.go': 'Go',
-    '.rs': 'Rust',
-    '.html': 'HTML',
-    '.css': 'CSS',
-    '.scss': 'SCSS',
-    '.less': 'LESS',
-    '.sql': 'SQL',
-    '.json': 'JSON',
-    '.sh': 'Shell',
-    '.vue': 'Vue.js',
-    '.swift': 'Swift',
-    '.kt': 'Kotlin',
-    '.dart': 'Dart',
-    '.r': 'R',
-    '.scala': 'Scala',
-    '.pl': 'Perl',
-    '.config.js': 'Configuration',
-    'eslint.config.js': 'ESLint Config',
-    'vite.config.js': 'Vite Config',
-    'webpack.config.js': 'Webpack Config'
+    '.js': 'JavaScript', '.jsx': 'JavaScript (React)', '.mjs': 'JavaScript (ES Module)',
+    '.ts': 'TypeScript', '.tsx': 'TypeScript (React)',
+    '.py': 'Python', '.pyw': 'Python',
+    '.java': 'Java', '.kt': 'Kotlin', '.kts': 'Kotlin',
+    '.cpp': 'C++', '.cc': 'C++', '.cxx': 'C++', '.hpp': 'C++',
+    '.c': 'C', '.h': 'C/C++ Header',
+    '.cs': 'C#', '.vb': 'Visual Basic',
+    '.php': 'PHP', '.rb': 'Ruby',
+    '.go': 'Go', '.rs': 'Rust',
+    '.html': 'HTML', '.htm': 'HTML',
+    '.css': 'CSS', '.scss': 'SCSS', '.sass': 'Sass', '.less': 'Less',
+    '.vue': 'Vue', '.svelte': 'Svelte',
+    '.swift': 'Swift', '.m': 'Objective-C',
+    '.sql': 'SQL', '.sh': 'Shell', '.bash': 'Bash',
+    '.json': 'JSON', '.xml': 'XML', '.yaml': 'YAML', '.yml': 'YAML'
   };
-  
-  // Check for specific config files
-  const basename = path.basename(filename);
-  if (langMap[basename]) return langMap[basename];
-  
   return langMap[ext] || 'Unknown';
 }
 
-// Get language-specific context and common patterns
-function getLanguageContext(language, filename) {
-  const contexts = {
-    'JavaScript': {
-      commonErrors: ['undefined variables', 'type coercion issues', 'async/await misuse', 'closure problems'],
-      frameworks: ['React', 'Node.js', 'Express'],
-      modernFeatures: ['ES6+ syntax', 'modules', 'destructuring', 'arrow functions']
-    },
-    'TypeScript': {
-      commonErrors: ['type mismatches', 'interface violations', 'generic type issues', 'strict mode violations'],
-      frameworks: ['React', 'Angular', 'Node.js'],
-      modernFeatures: ['strict typing', 'decorators', 'enums', 'utility types']
-    },
-    'Java': {
-      commonErrors: ['null pointer exceptions', 'type mismatches', 'static context issues', 'access modifiers'],
-      frameworks: ['Spring', 'Hibernate', 'Maven'],
-      modernFeatures: ['lambdas', 'streams', 'optional', 'modules']
-    },
-    'Python': {
-      commonErrors: ['indentation errors', 'undefined variables', 'type errors', 'import issues'],
-      frameworks: ['Django', 'Flask', 'FastAPI'],
-      modernFeatures: ['type hints', 'async/await', 'dataclasses', 'f-strings']
-    },
-    'ESLint Config': {
-      commonErrors: ['version compatibility', 'plugin conflicts', 'rule conflicts', 'parser issues'],
-      frameworks: ['ESLint v8', 'ESLint v9', 'TypeScript-ESLint'],
-      modernFeatures: ['flat config', 'extends vs plugins', 'overrides']
-    }
-  };
-  
-  return contexts[language] || contexts['JavaScript'];
+// Check if file is supported
+function isSupportedFile(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  const supportedExts = [
+    '.js', '.jsx', '.mjs', '.ts', '.tsx',
+    '.py', '.pyw', '.java', '.kt', '.kts',
+    '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp',
+    '.cs', '.vb', '.php', '.rb', '.go', '.rs',
+    '.html', '.htm', '.css', '.scss', '.sass',
+    '.vue', '.svelte', '.swift', '.m', '.sql'
+  ];
+  return supportedExts.includes(ext);
 }
 
-// Enhanced prompt generation
-function createAnalysisPrompt(code, filename, language, context) {
-  const lineCount = code.split('\n').length;
+// Groq API analysis
+async function analyzeWithGroq(code, filename) {
+  const language = detectLanguage(filename);
+  const cacheKey = `${filename}-${code.length}-${code.substring(0, 100)}`;
   
-  return `You are an expert code reviewer with deep knowledge of ${language} and modern development practices.
+  if (analysisCache.has(cacheKey)) {
+    const cached = analysisCache.get(cacheKey);
+    if (Date.now() - cached.timestamp < CACHE_DURATION) {
+      console.log(`✅ Using cached result for ${filename}`);
+      return cached.data;
+    }
+    analysisCache.delete(cacheKey);
+  }
+  
+  console.log(`\n${'='.repeat(70)}`);
+  console.log(`🔍 ANALYZING: ${filename}`);
+  console.log(`💻 Language: ${language}`);
+  console.log(`📏 Size: ${code.length} chars, ${code.split('\n').length} lines`);
+  
+  if (!process.env.GROQ_API_KEY) {
+    throw new Error('GROQ_API_KEY not configured');
+  }
 
-CRITICAL ANALYSIS INSTRUCTIONS:
-1. This is ${language} code from "${filename}" (${code.length} chars, ${lineCount} lines)
-2. Analyze ACTUAL CODE - not generic patterns
-3. Be contextually aware of ${language} conventions and modern practices
-4. Return ONLY valid JSON - no markdown, no extra text
+  const apiKey = process.env.GROQ_API_KEY.trim();
 
-LANGUAGE CONTEXT:
-- Language: ${language}
-- Common Issues: ${context.commonErrors.join(', ')}
-- Frameworks/Tools: ${context.frameworks.join(', ')}
-- Modern Features: ${context.modernFeatures.join(', ')}
+  const prompt = `You are an expert code reviewer with deep knowledge of ${language}. Perform a COMPREHENSIVE and ACCURATE analysis of this code.
 
-SPECIFIC ANALYSIS REQUIREMENTS:
-${getSpecificRequirements(language, filename)}
+FILE: ${filename}
+LANGUAGE: ${language}
+LINES: ${code.split('\n').length}
 
-CODE TO ANALYZE:
+CODE:
 \`\`\`${language.toLowerCase()}
 ${code}
 \`\`\`
 
-Return this EXACT JSON structure:
+CRITICAL INSTRUCTIONS:
+1. Only report REAL, ACTUAL issues that exist in the code
+2. Be SPECIFIC about line numbers - count carefully from line 1
+3. Verify each issue exists before reporting it
+4. Don't report issues that don't actually exist in the code
+5. Focus on issues that would prevent the code from working correctly
+
+ANALYZE FOR:
+
+🔴 CRITICAL ISSUES (Code won't run):
+- Syntax errors: typos in keywords, variables, functions
+- Missing brackets, parentheses, semicolons
+- Undefined variables or functions being used
+- Import/require statements for missing modules
+- Type errors (wrong data types)
+
+🟠 HIGH PRIORITY (Security & Logic):
+- Security vulnerabilities (SQL injection, XSS, hardcoded secrets)
+- Logic errors that cause wrong results
+- Null/undefined reference errors
+- Infinite loops or recursion issues
+- Race conditions
+
+🟡 MEDIUM PRIORITY (Performance & Quality):
+- Inefficient algorithms (O(n²) when O(n) possible)
+- Memory leaks or resource management
+- Code duplication
+- Poor error handling
+- Missing input validation
+
+🟢 LOW PRIORITY (Best Practices):
+- Naming conventions
+- Code organization
+- Comments and documentation
+- Style consistency
+
+Return ONLY valid JSON (no markdown, no explanations):
+
 {
   "errors": [
     {
-      "line": <number>,
-      "column": <number>,
-      "word": "<problematic_token>",
-      "type": "<specific_error_type>",
-      "level": "<architectural|syntax|logical|performance|security>",
-      "message": "<detailed_description>",
-      "severity": "<critical|high|medium|low>",
-      "context": "<surrounding_code_context>"
+      "line": 3,
+      "message": "Variable 'userName' is used but never declared",
+      "severity": "critical",
+      "type": "runtime",
+      "level": "syntax",
+      "suggestion": "Add 'const userName = ...' or 'let userName = ...' before using it",
+      "code_snippet": "console.log(userName);"
     }
   ],
   "suggestions": [
     {
-      "line": <number>,
-      "type": "<improvement_type>",
-      "level": "<architectural|syntax|logical|performance|security>",
-      "message": "<detailed_suggestion>",
-      "fix": "<specific_code_fix>",
-      "reasoning": "<why_this_improvement>"
+      "line": 5,
+      "message": "Add input validation for user data",
+      "type": "improvement",
+      "priority": "medium",
+      "fix": "Check if data exists and is valid before processing"
     }
   ],
   "codeMetrics": {
-    "complexity": "<low|medium|high>",
-    "maintainability": "<poor|fair|good|excellent>",
-    "testability": "<poor|fair|good|excellent>",
-    "performance": "<poor|fair|good|excellent>"
+    "complexity": "low|medium|high",
+    "maintainability": "poor|fair|good|excellent",
+    "security": "poor|fair|good|excellent",
+    "performance": "poor|fair|good|excellent",
+    "testability": "poor|fair|good|excellent"
   },
   "summary": {
-    "totalErrors": <number>,
-    "criticalErrors": <number>,
-    "warnings": <number>,
-    "codeQuality": "<excellent|good|fair|poor>",
-    "errorsByLevel": {
-      "architectural": <number>,
-      "syntax": <number>,
-      "logical": <number>,
-      "performance": <number>,
-      "security": <number>
-    },
-    "confidence": "<high|medium|low>"
+    "codeQuality": "poor|fair|good|excellent",
+    "strengths": ["specific strength 1", "specific strength 2"],
+    "weaknesses": ["specific weakness 1", "specific weakness 2"],
+    "overallAssessment": "Brief assessment of the code quality"
   }
-}
+}`;
 
-ANALYSIS FOCUS AREAS:
-- Syntax errors and typos
-- Logic flaws and incorrect implementations
-- Performance bottlenecks
-- Security vulnerabilities
-- Modern best practices violations
-- Framework-specific issues
-- Code organization and architecture
-- Type safety (for typed languages)
-- Error handling patterns
-- Resource management`;
-}
-
-// Get specific requirements based on language/file type
-function getSpecificRequirements(language, filename) {
-  const requirements = {
-    'JavaScript': 'Focus on: variable declarations, async/await usage, modern ES6+ features, React patterns if applicable',
-    'TypeScript': 'Focus on: type annotations, interface compliance, generic usage, strict mode compatibility',
-    'Java': 'Focus on: static/non-static context, access modifiers, exception handling, object-oriented principles',
-    'Python': 'Focus on: indentation, variable scope, import statements, PEP 8 compliance',
-    'ESLint Config': 'Focus on: ESLint version compatibility, plugin configurations, rule conflicts, flat vs legacy config',
-    'CSS': 'Focus on: selector specificity, responsive design, modern CSS features, browser compatibility',
-    'HTML': 'Focus on: semantic markup, accessibility, modern HTML5 features, validation'
-  };
-  
-  return requirements[language] || 'Focus on: syntax correctness, logic flow, error handling, best practices';
-}
-
-// Generate cache key
-function generateCacheKey(code, filename) {
-  const content = `${filename}:${code}`;
-  return crypto.createHash('sha256').update(content).digest('hex').substring(0, 16);
-}
-
-// Enhanced Gemini analysis with retry logic
-async function analyzeWithGemini(code, filename, retryCount = 0) {
-  const language = detectLanguage(filename);
-  const context = getLanguageContext(language, filename);
-  const cacheKey = generateCacheKey(code, filename);
-  
-  // Check cache
-  const cached = analysisCache.get(cacheKey);
-  if (cached && (Date.now() - cached.timestamp) < CACHE_DURATION) {
-    console.log(`📋 Cache hit for ${filename}`);
-    return cached.result;
-  }
-
-  const prompt = createAnalysisPrompt(code, filename, language, context);
-  
-  try {
-    console.log(`🔍 Analyzing ${filename} with Gemini (attempt ${retryCount + 1})...`);
-    
-    const requestBody = {
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.2,           // Lower for more consistent analysis
-        topK: 30,                  // Balanced diversity
-        topP: 0.9,                 // Good response quality
-        maxOutputTokens: 4000,     // Increased for detailed analysis
-        candidateCount: 1          // Single response
+  const requestBody = {
+    model: "llama-3.3-70b-versatile",
+    messages: [
+      {
+        role: "system",
+        content: "You are an expert code analyzer. You MUST respond with valid JSON only. Be accurate and specific."
       },
-      safetySettings: [
-        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-      ]
+      {
+        role: "user",
+        content: prompt
+      }
+    ],
+    temperature: 0.1,
+    max_tokens: 8192,
+    top_p: 0.8,
+    response_format: { type: "json_object" }
+  };
+
+  try {
+    console.log(`📡 Sending request to Groq API...`);
+    
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(requestBody)
+    });
+
+    console.log(`📥 Response status: ${response.status}`);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`❌ API Error Response:`, errorText);
+      throw new Error(`Groq API error (${response.status})`);
+    }
+
+    const data = await response.json();
+    const aiText = data?.choices?.[0]?.message?.content;
+    
+    if (!aiText) {
+      throw new Error('Empty response from Groq API');
+    }
+
+    console.log(`✅ Got AI response: ${aiText.length} chars`);
+
+    let analysisResult;
+    try {
+      let cleanedText = aiText.trim();
+      cleanedText = cleanedText.replace(/```json\s*/gi, '');
+      cleanedText = cleanedText.replace(/```\s*/gi, '');
+      cleanedText = cleanedText.trim();
+      
+      const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanedText = jsonMatch[0];
+      }
+
+      analysisResult = JSON.parse(cleanedText);
+      console.log(`✅ Successfully parsed JSON analysis`);
+    } catch (parseErr) {
+      console.error('⚠️ Failed to parse AI response as JSON');
+      
+      analysisResult = {
+        errors: [],
+        suggestions: [{
+          line: 1,
+          message: "AI analysis completed but response format was unclear",
+          type: "info",
+          priority: "low"
+        }],
+        codeMetrics: {
+          complexity: "unknown",
+          maintainability: "unknown",
+          security: "unknown",
+          performance: "unknown",
+          testability: "unknown"
+        },
+        summary: {
+          codeQuality: "unknown",
+          strengths: [],
+          weaknesses: ["Analysis format error"],
+          overallAssessment: "Unable to parse analysis results"
+        }
+      };
+    }
+
+    const result = {
+      errors: Array.isArray(analysisResult.errors) ? analysisResult.errors : [],
+      suggestions: Array.isArray(analysisResult.suggestions) ? analysisResult.suggestions : [],
+      codeMetrics: analysisResult.codeMetrics || {
+        complexity: "medium",
+        maintainability: "fair",
+        security: "fair",
+        performance: "fair",
+        testability: "fair"
+      },
+      summary: {
+        totalErrors: 0,
+        criticalErrors: 0,
+        highErrors: 0,
+        mediumErrors: 0,
+        lowErrors: 0,
+        totalSuggestions: 0,
+        codeQuality: analysisResult.summary?.codeQuality || "fair",
+        strengths: analysisResult.summary?.strengths || [],
+        weaknesses: analysisResult.summary?.weaknesses || [],
+        overallAssessment: analysisResult.summary?.overallAssessment || "Code analysis completed",
+        errorsByType: {
+          syntax: 0,
+          logical: 0,
+          runtime: 0,
+          security: 0,
+          performance: 0,
+          best_practices: 0
+        },
+        errorsByLevel: {
+          architectural: 0,
+          syntax: 0,
+          logical: 0,
+          performance: 0,
+          security: 0
+        }
+      }
     };
 
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { 
-          "Content-Type": "application/json",
-          "User-Agent": "CodeAnalyzer/1.0"
-        },
-        body: JSON.stringify(requestBody),
-      }
-    );
-    
-    if (!res.ok) {
-      const errorData = await res.text();
-      console.error(`❌ Gemini API error: ${res.status}`, errorData);
-      
-      // Retry logic for rate limits or temporary errors
-      if ((res.status === 429 || res.status >= 500) && retryCount < 2) {
-        const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
-        console.log(`⏳ Retrying in ${delay}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        return analyzeWithGemini(code, filename, retryCount + 1);
-      }
-      
-      throw new Error(`Gemini API error: ${res.status} - ${errorData}`);
-    }
-    
-    const data = await res.json();
-    const responseText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    
-    if (!responseText) {
-      throw new Error("Empty response from Gemini API");
-    }
+    result.errors = result.errors.map(err => ({
+      line: err.line || 1,
+      message: err.message || 'Unknown error',
+      severity: (err.severity || 'medium').toLowerCase(),
+      type: err.type || 'best_practices',
+      level: err.level || 'logical',
+      suggestion: err.suggestion || 'Review this code section',
+      code_snippet: err.code_snippet || ''
+    }));
 
-    // Enhanced response cleaning
-    let cleanedText = responseText
-      .replace(/```json\s*/gi, '')
-      .replace(/```\s*/gi, '')
-      .replace(/^[^{]*({.*})[^}]*$/s, '$1')  // Extract JSON object
-      .trim();
+    result.suggestions = result.suggestions.map(sug => ({
+      line: sug.line || 1,
+      message: sug.message || 'Consider reviewing this section',
+      type: sug.type || 'improvement',
+      priority: sug.priority || 'medium',
+      fix: sug.fix || ''
+    }));
 
-    console.log(`📝 Response length: ${cleanedText.length} chars`);
-    
-    try {
-      const parsedResult = JSON.parse(cleanedText);
+    result.summary.totalErrors = result.errors.length;
+    result.summary.totalSuggestions = result.suggestions.length;
+
+    result.errors.forEach(error => {
+      const severity = error.severity.toLowerCase();
+      switch (severity) {
+        case 'critical': result.summary.criticalErrors++; break;
+        case 'high': result.summary.highErrors++; break;
+        case 'medium': result.summary.mediumErrors++; break;
+        case 'low': result.summary.lowErrors++; break;
+      }
       
-      // Validate and enhance the result
-      const validatedResult = validateAndEnhanceResult(parsedResult, code, filename, language);
-      
-      // Cache the result
-      analysisCache.set(cacheKey, {
-        result: validatedResult,
-        timestamp: Date.now(),
-        language,
-        filename
-      });
-      
-      console.log(`✅ Analysis complete for ${filename}: ${validatedResult.errors?.length || 0} errors, ${validatedResult.suggestions?.length || 0} suggestions`);
-      
-      return validatedResult;
-      
-    } catch (parseError) {
-      console.error("❌ JSON parse error:", parseError.message);
-      console.error("Raw response preview:", cleanedText.substring(0, 500) + "...");
-      
-      // Attempt to extract partial information
-      return createFallbackResult(cleanedText, filename, language, parseError);
-    }
-    
+      const type = error.type || 'best_practices';
+      if (result.summary.errorsByType[type] !== undefined) {
+        result.summary.errorsByType[type]++;
+      }
+
+      const level = error.level || 'logical';
+      if (result.summary.errorsByLevel[level] !== undefined) {
+        result.summary.errorsByLevel[level]++;
+      }
+    });
+
+    console.log(`✅ Analysis complete:`);
+    console.log(`   📊 Total Errors: ${result.summary.totalErrors}`);
+    console.log(`   🔴 Critical: ${result.summary.criticalErrors}`);
+    console.log(`   🟠 High: ${result.summary.highErrors}`);
+    console.log(`   🟡 Medium: ${result.summary.mediumErrors}`);
+    console.log(`   🟢 Low: ${result.summary.lowErrors}`);
+    console.log(`${'='.repeat(70)}\n`);
+
+    analysisCache.set(cacheKey, {
+      timestamp: Date.now(),
+      data: result
+    });
+
+    return result;
+
   } catch (error) {
-    console.error(`❌ Analysis failed for ${filename}:`, error.message);
-    return createErrorResult(error, filename, language);
+    console.error(`\n❌ ANALYSIS FAILED:`);
+    console.error(`   Error: ${error.message}`);
+    console.error(`${'='.repeat(70)}\n`);
+    throw error;
   }
 }
 
-// Validate and enhance analysis result
-function validateAndEnhanceResult(result, code, filename, language) {
-  const lines = code.split('\n');
-  const enhanced = {
-    errors: [],
-    suggestions: [],
-    codeMetrics: {
-      complexity: "medium",
-      maintainability: "fair", 
-      testability: "fair",
-      performance: "fair"
-    },
-    summary: {
-      totalErrors: 0,
-      criticalErrors: 0,
-      warnings: 0,
-      codeQuality: "fair",
-      errorsByLevel: {
-        architectural: 0,
-        syntax: 0,
-        logical: 0,
-        performance: 0,
-        security: 0
-      },
-      confidence: "medium"
-    },
-    ...result
-  };
-
-  // Validate errors
-  if (result.errors && Array.isArray(result.errors)) {
-    enhanced.errors = result.errors
-      .filter(error => error.line > 0 && error.line <= lines.length)
-      .map(error => ({
-        ...error,
-        column: error.column || 1,
-        context: error.context || getLineContext(lines, error.line - 1)
-      }));
+// Parse GitHub URL
+function parseGitHubUrl(url) {
+  url = url.trim().replace(/\/$/, '').replace(/\.git$/, '');
+  
+  const patterns = [
+    /github\.com\/([^\/]+)\/([^\/]+)/,
+    /^([^\/]+)\/([^\/]+)$/
+  ];
+  
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) {
+      return {
+        owner: match[1],
+        repo: match[2]
+      };
+    }
   }
+  
+  throw new Error('Invalid GitHub URL format');
+}
 
-  // Validate suggestions
-  if (result.suggestions && Array.isArray(result.suggestions)) {
-    enhanced.suggestions = result.suggestions.map(suggestion => ({
-      reasoning: "Improves code quality",
-      ...suggestion
-    }));
-  }
-
-  // Recalculate summary
-  enhanced.summary.totalErrors = enhanced.errors.length;
-  enhanced.summary.criticalErrors = enhanced.errors.filter(e => e.severity === 'critical').length;
-  enhanced.summary.warnings = enhanced.suggestions.length;
-
-  // Count by level
-  enhanced.errors.forEach(error => {
-    const level = error.level || 'logical';
-    if (enhanced.summary.errorsByLevel[level] !== undefined) {
-      enhanced.summary.errorsByLevel[level]++;
+// Generate recommendations
+function generateRecommendations(metrics, stats) {
+  const recommendations = [];
+  
+  const rules = [
+    {
+      condition: () => metrics.criticalErrors > 0,
+      message: () => `🔴 ${metrics.criticalErrors} critical error${metrics.criticalErrors > 1 ? 's' : ''} require immediate attention`
+    },
+    {
+      condition: () => metrics.errorsByType.security > 0,
+      message: () => `🔒 ${metrics.errorsByType.security} security issue${metrics.errorsByType.security > 1 ? 's' : ''} detected`
+    },
+    {
+      condition: () => stats.filesWithoutErrors === stats.analyzedFiles && stats.analyzedFiles > 0,
+      message: () => `✅ Excellent! All ${stats.analyzedFiles} files are error-free`
+    }
+  ];
+  
+  rules.forEach(rule => {
+    if (rule.condition()) {
+      recommendations.push(rule.message());
     }
   });
-
-  return enhanced;
-}
-
-// Get context around a line of code
-function getLineContext(lines, lineIndex) {
-  if (lineIndex < 0 || lineIndex >= lines.length) return "";
   
-  const start = Math.max(0, lineIndex - 1);
-  const end = Math.min(lines.length, lineIndex + 2);
-  
-  return lines.slice(start, end)
-    .map((line, idx) => `${start + idx + 1}: ${line}`)
-    .join('\n');
-}
-
-// Create fallback result when JSON parsing fails
-function createFallbackResult(rawResponse, filename, language, error) {
-  return {
-    errors: [{
-      line: 1,
-      column: 1,
-      word: "response",
-      type: "parse_error",
-      level: "syntax",
-      message: `Failed to parse AI analysis. This might indicate an issue with the AI response format. Error: ${error.message}`,
-      severity: "medium",
-      context: `Raw response preview: ${rawResponse.substring(0, 200)}...`
-    }],
-    suggestions: [{
-      line: 1,
-      type: "retry_analysis",
-      level: "syntax", 
-      message: "The code analysis could not be completed due to a parsing error. Try analyzing this file again.",
-      fix: "Re-upload the file or check if the code contains unusual characters",
-      reasoning: "Parser errors can be temporary or caused by edge cases in the code"
-    }],
-    codeMetrics: {
-      complexity: "unknown",
-      maintainability: "unknown",
-      testability: "unknown", 
-      performance: "unknown"
-    },
-    summary: {
-      totalErrors: 1,
-      criticalErrors: 0,
-      warnings: 1,
-      codeQuality: "unknown",
-      errorsByLevel: { architectural: 0, syntax: 1, logical: 0, performance: 0, security: 0 },
-      confidence: "low"
-    }
-  };
-}
-
-// Create error result for API failures
-function createErrorResult(error, filename, language) {
-  const isRateLimit = error.message.includes('429');
-  const isQuotaExceeded = error.message.includes('quota') || error.message.includes('limit');
-  
-  return {
-    errors: [{
-      line: 1,
-      column: 1,
-      word: "api",
-      type: isRateLimit ? "rate_limit" : isQuotaExceeded ? "quota_exceeded" : "api_error",
-      level: "syntax",
-      message: `Analysis failed: ${error.message}. ${isRateLimit ? 'Rate limit exceeded. Try again in a few minutes.' : 'Check your API configuration.'}`,
-      severity: isRateLimit ? "medium" : "high",
-      context: `File: ${filename}, Language: ${language}`
-    }],
-    suggestions: [{
-      line: 1,
-      type: "configuration_check",
-      level: "syntax",
-      message: isRateLimit ? "Wait before retrying" : "Verify API setup",
-      fix: isRateLimit ? "Wait 1-2 minutes before analyzing more files" : "Check Gemini API key and quota limits",
-      reasoning: "API errors prevent code analysis from completing"
-    }],
-    codeMetrics: {
-      complexity: "unknown",
-      maintainability: "unknown", 
-      testability: "unknown",
-      performance: "unknown"
-    },
-    summary: {
-      totalErrors: 1,
-      criticalErrors: isRateLimit ? 0 : 1,
-      warnings: 1,
-      codeQuality: "unknown",
-      errorsByLevel: { architectural: 0, syntax: 1, logical: 0, performance: 0, security: 0 },
-      confidence: "low"
-    }
-  };
-}
-
-// Clean cache periodically
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [key, value] of analysisCache.entries()) {
-    if (now - value.timestamp > CACHE_DURATION) {
-      analysisCache.delete(key);
-      cleaned++;
-    }
+  if (recommendations.length === 0) {
+    recommendations.push(`📋 Analysis complete - review individual files`);
   }
-  if (cleaned > 0) {
-    console.log(`🧹 Cleaned ${cleaned} expired cache entries`);
-  }
-}, 15 * 60 * 1000); // Clean every 15 minutes
+  
+  return recommendations;
+}
 
-// Enhanced analysis endpoint
+// ============================================
+// API ENDPOINTS
+// ============================================
+
+// Analyze single file
 app.post("/analyze", async (req, res) => {
   const startTime = Date.now();
   
   try {
     const { code, filename = "unknown.js" } = req.body;
     
-    // Validation
-    if (!code || code.trim().length === 0) {
+    if (!code || typeof code !== 'string' || code.trim().length === 0) {
       return res.status(400).json({ 
-        error: "Empty code",
-        message: "Please provide non-empty code content for analysis"
+        error: "Invalid code",
+        message: "Please provide valid code content"
       });
     }
 
-    if (code.length > 100000) {
+    if (code.length > 500000) {
       return res.status(400).json({
-        error: "Code too large", 
-        message: "Please provide code smaller than 100KB for analysis"
+        error: "File too large",
+        message: "Maximum file size is 500KB"
       });
     }
 
-    const language = detectLanguage(filename);
+    const results = await analyzeWithGroq(code, filename);
     
-    console.log(`\n🚀 ANALYSIS REQUEST`);
-    console.log(`📁 File: ${filename}`);
-    console.log(`🔤 Language: ${language}`);
-    console.log(`📏 Size: ${code.length} chars, ${code.split('\n').length} lines`);
-    console.log(`⏱️  Started: ${new Date().toLocaleTimeString()}`);
-    
-    const results = await analyzeWithGemini(code, filename);
-    
-    const duration = Date.now() - startTime;
-    console.log(`\n✅ ANALYSIS COMPLETE`);
-    console.log(`📁 File: ${filename}`);
-    console.log(`⚠️  Errors: ${results.errors?.length || 0}`);
-    console.log(`💡 Suggestions: ${results.suggestions?.length || 0}`);
-    console.log(`🏆 Quality: ${results.summary?.codeQuality || 'unknown'}`);
-    console.log(`⏱️  Duration: ${duration}ms`);
-    console.log(`🎯 Confidence: ${results.summary?.confidence || 'medium'}`);
-    
-    // Add metadata to response
     results._metadata = {
-      processingTime: duration,
+      processingTime: Date.now() - startTime,
       timestamp: new Date().toISOString(),
-      language,
+      language: detectLanguage(filename),
       filename,
-      cacheHit: analysisCache.has(generateCacheKey(code, filename))
+      linesOfCode: code.split('\n').length
     };
     
     res.json(results);
     
   } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`❌ Analysis error (${duration}ms):`, error.message);
-    
     res.status(500).json({ 
       error: "Analysis failed",
-      message: error.message,
-      processingTime: duration
+      message: error.message
     });
   }
 });
 
-// GitHub Integration Routes (unchanged)
-app.post("/github/connect", async (req, res) => {
+// Fetch repository structure
+app.post("/fetch-repo-structure", async (req, res) => {
   try {
-    const { token } = req.body;
+    const { repoUrl } = req.body;
     
-    if (!token) {
-      return res.status(400).json({ error: "GitHub token is required" });
+    if (!repoUrl) {
+      return res.status(400).json({ 
+        error: "Missing repository URL"
+      });
     }
 
-    const octokit = new Octokit({ auth: token });
+    const { owner, repo } = parseGitHubUrl(repoUrl);
+    const octokit = new Octokit();
+
+    const { data: repoInfo } = await octokit.rest.repos.get({ owner, repo });
+    const branch = repoInfo.default_branch;
+
+    const { data: refData } = await octokit.rest.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${branch}`
+    });
     
-    const { data: user } = await octokit.rest.users.getAuthenticated();
+    const { data: treeData } = await octokit.rest.git.getTree({
+      owner,
+      repo,
+      tree_sha: refData.object.sha,
+      recursive: 'true'
+    });
+
+    const skipPaths = [
+      'node_modules', 'dist', 'build', '.git', 'vendor', 'venv', 
+      '__pycache__', '.next', 'coverage', 'target'
+    ];
+
+    const supportedFiles = [];
     
+    for (const item of treeData.tree) {
+      if (item.type !== 'blob') continue;
+      
+      const shouldSkip = skipPaths.some(skip => item.path.includes(skip));
+      if (shouldSkip) continue;
+      
+      if (!isSupportedFile(item.path)) continue;
+      
+      if (item.size && item.size > 500000) continue;
+      
+      supportedFiles.push({
+        path: item.path,
+        sha: item.sha,
+        size: item.size,
+        language: detectLanguage(item.path)
+      });
+    }
+
+    supportedFiles.sort((a, b) => a.path.localeCompare(b.path));
+
+    res.json({
+      repoInfo: {
+        repository: `${owner}/${repo}`,
+        branch,
+        totalFiles: supportedFiles.length
+      },
+      files: supportedFiles
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch repository structure",
+      message: error.message
+    });
+  }
+});
+
+// Analyze selected files
+app.post("/analyze-selected-files", async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    const { repoUrl, filePaths } = req.body;
+    
+    if (!repoUrl || !filePaths || !Array.isArray(filePaths) || filePaths.length === 0) {
+      return res.status(400).json({ 
+        error: "Invalid request"
+      });
+    }
+
+    if (filePaths.length > 20) {
+      return res.status(400).json({ 
+        error: "Maximum 20 files allowed"
+      });
+    }
+
+    const { owner, repo } = parseGitHubUrl(repoUrl);
+    const octokit = new Octokit();
+
+    const { data: repoInfo } = await octokit.rest.repos.get({ owner, repo });
+    const branch = repoInfo.default_branch;
+
+    const stats = {
+      analyzedFiles: 0,
+      filesWithErrors: 0,
+      filesWithoutErrors: 0,
+      failedAnalysis: 0
+    };
+
+    const results = [];
+    const failedFiles = [];
+
+    for (const filePath of filePaths) {
+      try {
+        const { data: fileData } = await octokit.rest.repos.getContent({
+          owner,
+          repo,
+          path: filePath,
+          ref: branch
+        });
+        
+        if (fileData.type !== 'file') continue;
+
+        const content = Buffer.from(fileData.content, 'base64').toString('utf-8');
+        
+        if (content.length > 500000) {
+          failedFiles.push({ path: filePath, error: 'File too large' });
+          continue;
+        }
+        
+        const analysis = await analyzeWithGroq(content, filePath);
+        stats.analyzedFiles++;
+        
+        const hasErrors = analysis.errors && analysis.errors.length > 0;
+        if (hasErrors) {
+          stats.filesWithErrors++;
+        } else {
+          stats.filesWithoutErrors++;
+        }
+        
+        results.push({
+          filename: filePath,
+          language: detectLanguage(filePath),
+          linesOfCode: content.split('\n').length,
+          fileSize: content.length,
+          errors: analysis.errors || [],
+          suggestions: analysis.suggestions || [],
+          summary: analysis.summary,
+          codeMetrics: analysis.codeMetrics,
+          hasErrors,
+          errorSummary: {
+            total: analysis.errors.length,
+            critical: analysis.summary.criticalErrors,
+            high: analysis.summary.highErrors,
+            medium: analysis.summary.mediumErrors,
+            low: analysis.summary.lowErrors
+          }
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 200));
+        
+      } catch (error) {
+        stats.failedAnalysis++;
+        failedFiles.push({ path: filePath, error: error.message });
+      }
+    }
+
+    const aggregateMetrics = {
+      totalErrors: 0,
+      criticalErrors: 0,
+      highErrors: 0,
+      mediumErrors: 0,
+      lowErrors: 0,
+      totalSuggestions: 0,
+      errorsByType: {
+        syntax: 0,
+        logical: 0,
+        runtime: 0,
+        security: 0,
+        performance: 0,
+        best_practices: 0
+      },
+      errorsByLevel: {
+        architectural: 0,
+        syntax: 0,
+        logical: 0,
+        performance: 0,
+        security: 0
+      }
+    };
+
+    results.forEach(result => {
+      aggregateMetrics.totalErrors += result.errors.length;
+      aggregateMetrics.totalSuggestions += result.suggestions.length;
+      
+      result.errors.forEach(error => {
+        const severity = error.severity?.toLowerCase() || 'medium';
+        if (severity === 'critical') aggregateMetrics.criticalErrors++;
+        else if (severity === 'high') aggregateMetrics.highErrors++;
+        else if (severity === 'medium') aggregateMetrics.mediumErrors++;
+        else if (severity === 'low') aggregateMetrics.lowErrors++;
+        
+        const type = error.type || 'best_practices';
+        if (aggregateMetrics.errorsByType[type] !== undefined) {
+          aggregateMetrics.errorsByType[type]++;
+        }
+        
+        const level = error.level || 'logical';
+        if (aggregateMetrics.errorsByLevel[level] !== undefined) {
+          aggregateMetrics.errorsByLevel[level]++;
+        }
+      });
+    });
+
+    res.json({
+      repository: `${owner}/${repo}`,
+      branch,
+      stats,
+      aggregateMetrics,
+      processingTime: Date.now() - startTime,
+      results: results.filter(r => r.hasErrors),
+      allResults: results,
+      skippedFiles: { failed: failedFiles }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      error: "Analysis failed",
+      message: error.message
+    });
+  }
+});
+
+// Save analysis to history
+app.post("/save-analysis", async (req, res) => {
+  try {
+    const { 
+      user_id, analysis_type, repository_name, file_count,
+      total_errors, critical_errors, high_errors, 
+      medium_errors, low_errors, analysis_data
+    } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing user_id'
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('analysis_history')
+      .insert([{
+        user_id,
+        analysis_type,
+        repository_name: repository_name || null,
+        file_count: file_count || 0,
+        total_errors: total_errors || 0,
+        critical_errors: critical_errors || 0,
+        high_errors: high_errors || 0,
+        medium_errors: medium_errors || 0,
+        low_errors: low_errors || 0,
+        analysis_data: analysis_data || {},
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    console.log('✅ Analysis saved:', data.id);
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('❌ Error saving:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to save analysis',
+      message: error.message
+    });
+  }
+});
+
+// Get user's own history
+app.get("/my-history/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const { data: history, error } = await supabase
+      .from('analysis_history')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
     res.json({
       success: true,
-      user: {
-        login: user.login,
-        name: user.name,
-        avatar_url: user.avatar_url
-      }
+      history: history || [],
+      totalAnalyses: history?.length || 0
     });
   } catch (error) {
-    console.error("GitHub connection error:", error);
-    res.status(401).json({ 
-      error: "Invalid GitHub token or API error",
-      message: error.message 
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch history',
+      message: error.message
     });
   }
 });
 
-app.get("/github/repos", async (req, res) => {
+// Get all users (Admin)
+app.get("/admin/users", async (req, res) => {
   try {
-    const { token } = req.query;
-    
-    if (!token) {
-      return res.status(400).json({ error: "GitHub token is required" });
-    }
+    const { data: users, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .order('created_at', { ascending: false });
 
-    const octokit = new Octokit({ auth: token });
-    
-    const { data: repos } = await octokit.rest.repos.listForAuthenticatedUser({
-      sort: 'updated',
-      per_page: 20
-    });
+    if (error) throw error;
 
-    const formattedRepos = repos.map(repo => ({
-      name: repo.name,
-      full_name: repo.full_name,
-      private: repo.private,
-      updated_at: repo.updated_at,
-      language: repo.language,
-      default_branch: repo.default_branch
-    }));
-
-    res.json(formattedRepos);
-  } catch (error) {
-    console.error("GitHub repos error:", error);
-    res.status(500).json({ 
-      error: "Failed to fetch repositories",
-      message: error.message 
-    });
-  }
-});
-
-app.get("/github/files", async (req, res) => {
-  try {
-    const { token, owner, repo, path: filePath = '' } = req.query;
-    
-    if (!token || !owner || !repo) {
-      return res.status(400).json({ error: "Missing required parameters" });
-    }
-
-    const octokit = new Octokit({ auth: token });
-    
-    const { data: contents } = await octokit.rest.repos.getContent({
-      owner,
-      repo,
-      path: filePath
-    });
-
-    const supportedExtensions = ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.cpp', '.c', '.cs', '.php', '.rb', '.go', '.rs', '.html', '.css', '.vue', '.swift', '.kt', '.dart', '.r', '.scala', '.pl'];
-    
-    const files = (Array.isArray(contents) ? contents : [contents])
-      .filter(item => {
-        if (item.type === 'file') {
-          const ext = path.extname(item.name).toLowerCase();
-          return supportedExtensions.includes(ext);
-        }
-        return item.type === 'dir';
-      })
-      .map(item => ({
-        name: item.name,
-        path: item.path,
-        type: item.type,
-        size: item.size,
-        download_url: item.download_url
-      }));
-
-    res.json(files);
-  } catch (error) {
-    console.error("GitHub files error:", error);
-    res.status(500).json({ 
-      error: "Failed to fetch repository files",
-      message: error.message 
-    });
-  }
-});
-
-app.get("/github/file-content", async (req, res) => {
-  try {
-    const { token, owner, repo, path: filePath } = req.query;
-    
-    if (!token || !owner || !repo || !filePath) {
-      return res.status(400).json({ error: "Missing required parameters" });
-    }
-
-    const octokit = new Octokit({ auth: token });
-    
-    const { data: fileData } = await octokit.rest.repos.getContent({
-      owner,
-      repo,
-      path: filePath
-    });
-
-    if (fileData.type !== 'file') {
-      return res.status(400).json({ error: "Path is not a file" });
-    }
-
-    const content = Buffer.from(fileData.content, 'base64').toString('utf-8');
-    
     res.json({
-      name: fileData.name,
-      path: fileData.path,
-      content: content,
-      size: fileData.size
+      success: true,
+      users: users || []
     });
   } catch (error) {
-    console.error("GitHub file content error:", error);
-    res.status(500).json({ 
-      error: "Failed to fetch file content",
-      message: error.message 
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch users',
+      message: error.message
     });
   }
 });
 
-// Enhanced health check
+// Get user history (Admin)
+app.get("/admin/user-history/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const { data: history, error } = await supabase
+      .from('analysis_history')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      history: history || []
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch user history',
+      message: error.message
+    });
+  }
+});
+
+// Health check
 app.get("/health", (req, res) => {
   res.json({ 
-    status: "OK", 
+    status: "healthy",
+    service: "Code Review Bot API",
+    groq_configured: !!process.env.GROQ_API_KEY,
     timestamp: new Date().toISOString(),
-    gemini_key_configured: !!process.env.GEMINI_API_KEY,
-    cache_size: analysisCache.size,
-    cache_keys_sample: Array.from(analysisCache.keys()).slice(0, 5),
-    memory_usage: process.memoryUsage(),
-    uptime_seconds: process.uptime()
+    version: "2.4.0"
   });
 });
 
-// Analytics endpoint
-app.get("/analytics", (req, res) => {
-  const cacheEntries = Array.from(analysisCache.values());
-  const languageStats = {};
-  
-  cacheEntries.forEach(entry => {
-    const lang = entry.language || 'unknown';
-    languageStats[lang] = (languageStats[lang] || 0) + 1;
-  });
-  
-  res.json({
-    total_analyses: cacheEntries.length,
-    languages_analyzed: languageStats,
-    cache_hit_rate: "Not implemented yet",
-    average_errors_per_file: cacheEntries.length > 0 
-      ? cacheEntries.reduce((sum, entry) => sum + (entry.result.errors?.length || 0), 0) / cacheEntries.length 
-      : 0
+// Error handling
+app.use((err, req, res, next) => {
+  console.error('❌ Error:', err);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: err.message
   });
 });
 
-// Cache management endpoints
-app.get("/cache/status", (req, res) => {
-  const entries = Array.from(analysisCache.entries()).map(([key, value]) => ({
-    key: key.substring(0, 8) + '...',
-    filename: value.filename,
-    language: value.language,
-    age_minutes: Math.round((Date.now() - value.timestamp) / 60000),
-    errors: value.result.errors?.length || 0
-  }));
-
-  res.json({
-    size: analysisCache.size,
-    entries: entries.slice(0, 20), // Show latest 20
-    total_memory_kb: Math.round(JSON.stringify(Array.from(analysisCache.values())).length / 1024)
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Not found',
+    message: `Endpoint ${req.method} ${req.path} not found`
   });
 });
 
-app.post("/cache/clear", (req, res) => {
-  const oldSize = analysisCache.size;
-  analysisCache.clear();
-  console.log(`🧹 Cache manually cleared: ${oldSize} entries removed`);
-  
-  res.json({ 
-    message: "Cache cleared successfully",
-    entries_removed: oldSize,
-    timestamp: new Date().toISOString()
-  });
-});
-
+// Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`\n🚀 Code Analysis Server Started`);
-  console.log(`📍 URL: http://localhost:${PORT}`);
-  console.log(`🔑 Gemini API: ${process.env.GEMINI_API_KEY ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`💾 Cache: ✅ Initialized`);
-  console.log(`⏰ Time: ${new Date().toLocaleString()}`);
-  console.log(`\nEndpoints:`);
-  console.log(`  POST /analyze - Code analysis`);
-  console.log(`  GET  /health - System status`);
-  console.log(`  GET  /analytics - Usage statistics`);
-  console.log(`  GET  /cache/status - Cache information`);
-  console.log(`\n🎯 Ready for enhanced code analysis!\n`);
+  console.log('\n' + '█'.repeat(80));
+  console.log('🚀  CODE REVIEW BOT - BACKEND v2.4');
+  console.log('█'.repeat(80));
+  console.log(`\n🌐  Server: http://localhost:${PORT}`);
+  console.log(`🤖  Groq AI: ${process.env.GROQ_API_KEY ? '✅ CONFIGURED' : '❌ NOT FOUND'}`);
+  console.log(`📅  Started: ${new Date().toLocaleString()}`);
+  console.log('\n' + '█'.repeat(80) + '\n');
 });

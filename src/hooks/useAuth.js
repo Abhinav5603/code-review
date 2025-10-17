@@ -9,7 +9,7 @@ export function useAuth() {
   });
 
   useEffect(() => {
-    let mounted = true; // Prevent state updates if component is unmounted
+    let mounted = true;
 
     const initializeAuth = async () => {
       try {
@@ -44,7 +44,16 @@ export function useAuth() {
       async (event, session) => {
         if (!mounted) return;
 
+        console.log('Auth state change event:', event);
+
         try {
+          // Handle SIGNED_OUT event explicitly
+          if (event === 'SIGNED_OUT') {
+            console.log('User signed out, clearing state');
+            setAuthState({ user: null, profile: null, loading: false });
+            return;
+          }
+
           if (session?.user) {
             await fetchProfile(session.user, mounted);
           } else {
@@ -72,10 +81,8 @@ export function useAuth() {
     }
 
     try {
-      // Get the role from user metadata
       const metadataRole = user.user_metadata?.role;
       
-      // Create profile object from user metadata (primary source)
       const profileFromMetadata = {
         id: user.id,
         email: user.email,
@@ -83,14 +90,12 @@ export function useAuth() {
         role: metadataRole || 'user',
       };
 
-      // Try to get profile from database with timeout
       const profilePromise = supabase
         .from('profiles')
         .select('*')
         .eq('id', user.id)
         .single();
 
-      // Add timeout to prevent hanging
       const timeoutPromise = new Promise((_, reject) => 
         setTimeout(() => reject(new Error('Profile fetch timeout')), 10000)
       );
@@ -112,7 +117,6 @@ export function useAuth() {
         return;
       }
 
-      // If profile doesn't exist in DB, create it
       if (error && error.code === 'PGRST116') {
         try {
           const { data: createdProfile, error: createError } = await supabase
@@ -137,11 +141,9 @@ export function useAuth() {
         }
       }
 
-      // If we got profile from DB successfully
       if (profile && !error) {
         const finalProfile = {
           ...profile,
-          // Use metadata role if it exists, otherwise use DB role
           role: metadataRole || profile.role || 'user',
         };
 
@@ -155,7 +157,6 @@ export function useAuth() {
         return;
       }
 
-      // Fallback: use metadata profile
       if (mounted) {
         setAuthState({
           user,
@@ -167,7 +168,6 @@ export function useAuth() {
     } catch (error) {
       console.error('Error fetching profile:', error);
       
-      // Always ensure loading is set to false and provide fallback profile
       if (mounted) {
         const metadataRole = user.user_metadata?.role;
         setAuthState({
@@ -211,12 +211,33 @@ export function useAuth() {
   };
 
   const signOut = async () => {
-    // Clear local state immediately
-    setAuthState({ user: null, profile: null, loading: false });
-    
-    const { error } = await supabase.auth.signOut();
-    if (error) {
-      console.error('Error signing out:', error);
+    try {
+      console.log('🚪 Starting logout process...');
+      
+      // IMPORTANT: Sign out from Supabase FIRST
+      // This will clear the session from localStorage and trigger SIGNED_OUT event
+      const { error } = await supabase.auth.signOut();
+      
+      if (error) {
+        console.error('❌ Error signing out from Supabase:', error);
+        throw error;
+      }
+      
+      console.log('✅ Successfully signed out from Supabase');
+      
+      // Clear local state (this will also be handled by the SIGNED_OUT event listener)
+      setAuthState({ user: null, profile: null, loading: false });
+      
+      // Optional: Clear any additional localStorage/sessionStorage items your app uses
+      // (Don't clear everything as it might break other apps in the same domain)
+      // localStorage.removeItem('your-app-specific-key');
+      
+      console.log('✅ Logout complete');
+      
+    } catch (error) {
+      console.error('❌ Logout failed:', error);
+      // Even if there's an error, clear local state for security
+      setAuthState({ user: null, profile: null, loading: false });
       throw error;
     }
   };
@@ -225,7 +246,6 @@ export function useAuth() {
     if (!authState.user) throw new Error('No user logged in');
 
     try {
-      // If role is being updated, also update user metadata
       if (updates.role) {
         const { error: metadataError } = await supabase.auth.updateUser({
           data: { 
