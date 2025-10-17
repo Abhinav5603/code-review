@@ -38,7 +38,7 @@ import {
   BarChart3
 } from "lucide-react";
 
-const API_BASE = "http://localhost:5000";
+const API_BASE = "https://code-review-e2n7.onrender.com";
 
 function CodeReviewUI({ onBack, profile, onLogout }) {
   const handleLogout = async () => {
