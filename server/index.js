@@ -498,7 +498,10 @@ app.post("/fetch-repo-structure", async (req, res) => {
     }
 
     const { owner, repo } = parseGitHubUrl(repoUrl);
-    const octokit = new Octokit();
+    // In index.js, update the Octokit initialization
+const octokit = new Octokit({
+  auth: process.env.GITHUB_TOKEN
+});
 
     const { data: repoInfo } = await octokit.rest.repos.get({ owner, repo });
     const branch = repoInfo.default_branch;
