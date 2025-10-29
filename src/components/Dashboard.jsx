@@ -76,6 +76,9 @@ function CodeReviewUI({ onBack, profile, onLogout }) {
   // NEW: Accept/Reject state management
   const [acceptedErrors, setAcceptedErrors] = useState(new Set());
   const [rejectedErrors, setRejectedErrors] = useState(new Set());
+  const [rejectionReasons, setRejectionReasons] = useState(new Map());
+  const [showRejectModal, setShowRejectModal] = useState(false);
+  const [currentRejectError, setCurrentRejectError] = useState(null);
 
   // NEW: Calculate statistics for graph
  // NEW: Calculate statistics for graph
@@ -149,19 +152,40 @@ function CodeReviewUI({ onBack, profile, onLogout }) {
   };
 
   // NEW: Handle reject error
-  const handleRejectError = (resultId, error) => {
-    const errorKey = `${resultId}-${error.line}-${error.message}`;
-    setRejectedErrors(prev => {
-      const newSet = new Set(prev);
-      newSet.add(errorKey);
-      return newSet;
-    });
-    setAcceptedErrors(prev => {
-      const newSet = new Set(prev);
-      newSet.delete(errorKey);
-      return newSet;
-    });
-  };
+ // Handle reject error - show modal
+const handleRejectError = (resultId, error) => {
+  setCurrentRejectError({ resultId, error });
+  setShowRejectModal(true);
+};
+
+// Confirm rejection with reason
+const confirmRejectError = (reason) => {
+  if (!currentRejectError) return;
+  
+  const { resultId, error } = currentRejectError;
+  const errorKey = `${resultId}-${error.line}-${error.message}`;
+  
+  setRejectedErrors(prev => {
+    const newSet = new Set(prev);
+    newSet.add(errorKey);
+    return newSet;
+  });
+  
+  setRejectionReasons(prev => {
+    const newMap = new Map(prev);
+    newMap.set(errorKey, reason);
+    return newMap;
+  });
+  
+  setAcceptedErrors(prev => {
+    const newSet = new Set(prev);
+    newSet.delete(errorKey);
+    return newSet;
+  });
+  
+  setShowRejectModal(false);
+  setCurrentRejectError(null);
+};
 
   // NEW: Check if error is accepted/rejected
   const getErrorStatus = (resultId, error) => {
@@ -170,6 +194,11 @@ function CodeReviewUI({ onBack, profile, onLogout }) {
     if (rejectedErrors.has(errorKey)) return 'rejected';
     return 'pending';
   };
+  // Get rejection reason
+const getRejectionReason = (resultId, error) => {
+  const errorKey = `${resultId}-${error.line}-${error.message}`;
+  return rejectionReasons.get(errorKey) || 'No reason provided';
+};
 
   // Fetch my analysis history
 const fetchMyHistory = async () => {
@@ -862,30 +891,6 @@ const saveAnalysisToHistory = async (analysisData) => {
               <h2 className="text-lg font-bold text-white">Error Statistics Dashboard</h2>
             </div>
 
-            {/* Summary Cards */}
-            <div className="grid grid-cols-5 gap-3 mb-5">
-              <div className="bg-slate-900/50 rounded-lg p-3 text-center border border-white/5">
-                <p className="text-2xl font-bold text-cyan-400">{stats.total}</p>
-                <p className="text-slate-400 text-xs mt-0.5">Total</p>
-              </div>
-              <div className="bg-rose-500/10 rounded-lg p-3 text-center border border-rose-500/30">
-                <p className="text-2xl font-bold text-rose-400">{stats.critical}</p>
-                <p className="text-rose-400 text-xs mt-0.5">Critical</p>
-              </div>
-              <div className="bg-orange-500/10 rounded-lg p-3 text-center border border-orange-500/30">
-                <p className="text-2xl font-bold text-orange-400">{stats.high}</p>
-                <p className="text-orange-400 text-xs mt-0.5">High</p>
-              </div>
-              <div className="bg-yellow-500/10 rounded-lg p-3 text-center border border-yellow-500/30">
-                <p className="text-2xl font-bold text-yellow-400">{stats.medium}</p>
-                <p className="text-yellow-400 text-xs mt-0.5">Medium</p>
-              </div>
-              <div className="bg-blue-500/10 rounded-lg p-3 text-center border border-blue-500/30">
-                <p className="text-2xl font-bold text-blue-400">{stats.low}</p>
-                <p className="text-blue-400 text-xs mt-0.5">Low</p>
-              </div>
-            </div>
-
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-5">
               {/* Severity Bar Graph */}
               <div className="bg-slate-900/30 rounded-xl p-4 border border-white/5">
@@ -987,21 +992,36 @@ const saveAnalysisToHistory = async (analysisData) => {
               </div>
             </div>
 
-            {/* Action Summary */}
-            <div className="grid grid-cols-2 gap-3">
-              <div className="bg-emerald-500/10 rounded-lg p-3 border border-emerald-500/30">
-                <div className="flex items-center justify-between">
-                  <span className="text-emerald-400 text-sm font-semibold">Resolved</span>
-                  <span className="text-xl font-bold text-emerald-400">{acceptedErrors.size}</span>
-                </div>
-              </div>
-              <div className="bg-rose-500/10 rounded-lg p-3 border border-rose-500/30">
-                <div className="flex items-center justify-between">
-                  <span className="text-rose-400 text-sm font-semibold">Won't Fix</span>
-                  <span className="text-xl font-bold text-rose-400">{rejectedErrors.size}</span>
-                </div>
-              </div>
-            </div>
+       {/* Action Summary */}
+<div className="grid grid-cols-2 gap-3">
+  <div className="bg-emerald-500/10 rounded-lg p-3 border border-emerald-500/30">
+    <div className="flex items-center justify-between">
+      <span className="text-emerald-400 text-sm font-semibold">Accepted</span>
+      <span className="text-xl font-bold text-emerald-400">{acceptedErrors.size}</span>
+    </div>
+  </div>
+  <div className="bg-rose-500/10 rounded-lg p-3 border border-rose-500/30">
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between">
+        <span className="text-rose-400 text-sm font-semibold">Rejected</span>
+        <span className="text-xl font-bold text-rose-400">{rejectedErrors.size}</span>
+      </div>
+      {rejectedErrors.size > 0 && (
+        <div className="text-xs text-rose-300/70 mt-1 space-y-0.5">
+          {Array.from(rejectedErrors).slice(0, 2).map((errorKey, idx) => {
+            const reason = rejectionReasons.get(errorKey);
+            return reason ? (
+              <div key={idx} className="truncate">• {reason}</div>
+            ) : null;
+          })}
+          {rejectedErrors.size > 2 && (
+            <div className="text-rose-300/50">+{rejectedErrors.size - 2} more</div>
+          )}
+        </div>
+      )}
+    </div>
+  </div>
+</div>
           </div>
         )}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -1477,24 +1497,6 @@ const saveAnalysisToHistory = async (analysisData) => {
                         </div>
                       </div>
 
-                      {/* Summary Stats */}
-                      {result.summary && (
-                        <div className="grid grid-cols-3 gap-4 mb-5 p-5 bg-slate-800/50 rounded-xl border border-white/5">
-                          <div className="text-center">
-                            <p className="text-2xl font-bold text-rose-400">{result.summary.totalErrors || 0}</p>
-                            <p className="text-slate-400 text-sm mt-1">Total Errors</p>
-                          </div>
-                          <div className="text-center">
-                            <p className="text-2xl font-bold text-orange-400">{result.summary.criticalErrors || 0}</p>
-                            <p className="text-slate-400 text-sm mt-1">Critical</p>
-                          </div>
-                          <div className="text-center">
-                            <p className="text-2xl font-bold text-yellow-400">{result.summary.highErrors || 0}</p>
-                            <p className="text-slate-400 text-sm mt-1">High Priority</p>
-                          </div>
-                        </div>
-                      )}
-
                       {/* Errors with Accept/Reject Buttons */}
                       {result.errors && result.errors.length > 0 && (
                         <div className="mb-5">
@@ -1546,7 +1548,7 @@ const saveAnalysisToHistory = async (analysisData) => {
                                               ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' 
                                               : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
                                           }`}>
-                                            {status === 'accepted' ? '✓ Resolved' : '✗ Won\'t Fix'}
+                                            {status === 'accepted' ? '✓ Accepted' : '✗ Rejected'}
                                           </span>
                                         )}
                                       </div>
@@ -1557,7 +1559,7 @@ const saveAnalysisToHistory = async (analysisData) => {
                                         </p>
                                       )}
 
-                                      {/* Accept/Reject Buttons */}
+                                  {/* Accept/Reject Buttons */}
                                       <div className="flex gap-2 mt-3">
                                         <button
                                           onClick={() => handleAcceptError(result.id, err)}
@@ -1567,10 +1569,10 @@ const saveAnalysisToHistory = async (analysisData) => {
                                               ? 'bg-emerald-500/30 text-emerald-300 cursor-not-allowed'
                                               : 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 hover:text-emerald-300 border border-emerald-500/30 hover:scale-105 active:scale-95'
                                           }`}
-                                          title="Accept & Mark as Resolved"
+                                          title={status === 'accepted' ? 'Accepted' : 'Accept this error'}
                                         >
                                           <Check className="w-4 h-4" />
-                                          {status === 'accepted' ? 'Resolved' : 'Accept & Resolve'}
+                                          {status === 'accepted' ? 'Accepted' : 'Accept'}
                                         </button>
                                         <button
                                           onClick={() => handleRejectError(result.id, err)}
@@ -1580,50 +1582,18 @@ const saveAnalysisToHistory = async (analysisData) => {
                                               ? 'bg-rose-500/30 text-rose-300 cursor-not-allowed'
                                               : 'bg-rose-500/20 hover:bg-rose-500/30 text-rose-400 hover:text-rose-300 border border-rose-500/30 hover:scale-105 active:scale-95'
                                           }`}
-                                          title="Reject & Mark as Won't Fix"
+                                          title={status === 'rejected' ? 'Rejected' : 'Reject this error'}
                                         >
                                           <XCircle className="w-4 h-4" />
-                                          {status === 'rejected' ? 'Won\'t Fix' : 'Reject'}
+                                          {status === 'rejected' ? 'Rejected' : 'Reject'}
                                         </button>
                                       </div>
+                                      
                                     </div>
                                   </div>
                                 </div>
                               );
                             })}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Suggestions */}
-                      {result.suggestions && result.suggestions.length > 0 && (
-                        <div>
-                          <h4 className="text-slate-300 font-semibold mb-4 flex items-center gap-2">
-                            <Info className="w-4 h-4 text-blue-400" />
-                            <span>Suggestions ({result.suggestions.length})</span>
-                          </h4>
-                          <div className="space-y-3">
-                            {result.suggestions.map((suggestion, idx) => (
-                              <div
-                                key={idx}
-                                className="p-4 bg-blue-500/10 rounded-xl border border-blue-500/20"
-                              >
-                                <div className="flex items-start gap-2">
-                                  <Info className="w-4 h-4 text-blue-400 mt-0.5" />
-                                  <div className="flex-1">
-                                    <p className="text-blue-300 text-sm font-semibold mb-1">
-                                      Line {suggestion.line || 'N/A'} • {suggestion.type || 'Improvement'}
-                                    </p>
-                                    <p className="text-blue-200 text-sm leading-relaxed">{suggestion.message}</p>
-                                    {suggestion.fix && (
-                                      <p className="text-blue-200/80 text-xs mt-2 bg-black/20 p-2 rounded">
-                                        💡 {suggestion.fix}
-                                      </p>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-                            ))}
                           </div>
                         </div>
                       )}
@@ -1738,46 +1708,53 @@ const saveAnalysisToHistory = async (analysisData) => {
                 </div>
               </div>
             )}
-
-            {/* Help Card */}
-            {!loading && !loadingRepo && repoFiles.length === 0 && reviewResults.length === 0 && activeTab !== "history" && (
-              <div className="bg-gradient-to-br from-blue-500/10 to-purple-500/10 backdrop-blur-xl rounded-3xl p-6 shadow-2xl border border-blue-500/20">
-                <h3 className="text-lg font-bold text-white mb-3 flex items-center gap-2">
-                  <Info className="w-5 h-5 text-blue-400" />
-                  How to Use
-                </h3>
-                <div className="space-y-3 text-sm text-slate-300">
-                  <div className="flex gap-3">
-                    <div className="flex-shrink-0 w-6 h-6 bg-blue-500/20 rounded-full flex items-center justify-center text-blue-400 font-bold text-xs">
-                      1
-                    </div>
-                    <p>Enter a GitHub repository URL and click Browse</p>
-                  </div>
-                  <div className="flex gap-3">
-                    <div className="flex-shrink-0 w-6 h-6 bg-blue-500/20 rounded-full flex items-center justify-center text-blue-400 font-bold text-xs">
-                      2
-                    </div>
-                    <p>Select up to 20 files you want to analyze</p>
-                  </div>
-                  <div className="flex gap-3">
-                    <div className="flex-shrink-0 w-6 h-6 bg-blue-500/20 rounded-full flex items-center justify-center text-blue-400 font-bold text-xs">
-                      3
-                    </div>
-                    <p>Click "Analyze Selected Files" to start review</p>
-                  </div>
-                  <div className="flex gap-3">
-                    <div className="flex-shrink-0 w-6 h-6 bg-blue-500/20 rounded-full flex items-center justify-center text-blue-400 font-bold text-xs">
-                      4
-                    </div>
-                    <p>Review errors and use Accept/Reject buttons</p>
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
         </div>
       </div>
+{/* Rejection Reason Modal */}
+{showRejectModal && (
+  <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div className="bg-slate-800 rounded-3xl shadow-2xl border border-white/10 max-w-md w-full">
+      <div className="p-6 border-b border-white/10">
+        <h3 className="text-xl font-bold text-white">Reject Error</h3>
+        <p className="text-slate-400 text-sm mt-1">Please select a reason for rejection</p>
+      </div>
 
+      <div className="p-6 space-y-3">
+        {[
+          'False Positive',
+          'Not Applicable',
+          'Will Fix Later',
+          'Design Decision',
+          'Third-party Code',
+          'Low Priority',
+          'Duplicate Issue',
+          'Already Fixed'
+        ].map((reason) => (
+          <button
+            key={reason}
+            onClick={() => confirmRejectError(reason)}
+            className="w-full px-4 py-3 bg-slate-900/50 hover:bg-slate-900/80 rounded-xl text-left text-white transition-all border border-white/5 hover:border-rose-500/30 hover:scale-[1.02]"
+          >
+            {reason}
+          </button>
+        ))}
+      </div>
+
+      <div className="p-6 border-t border-white/10">
+        <button
+          onClick={() => {
+            setShowRejectModal(false);
+            setCurrentRejectError(null);
+          }}
+          className="w-full px-4 py-3 bg-slate-700/50 hover:bg-slate-700/70 rounded-xl text-white font-medium transition-all"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  </div>
+)}
       {/* Custom Scrollbar Styles */}
       <style>{`
         .custom-scrollbar::-webkit-scrollbar {
